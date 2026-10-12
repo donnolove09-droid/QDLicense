@@ -1,0 +1,8 @@
+Package: com.example.qdlicense
+Name: QDLicense
+Version: 1.0.0
+Architecture: iphoneos-arm
+Description: License key check via own server
+Maintainer: you
+Author: you
+Section: Tweaks
