@@ -5,6 +5,7 @@
 
 #import <UIKit/UIKit.h>
 #import <Security/Security.h>
+#import <sys/utsname.h>
 
 static NSString *const kSavedKey = @"qd_license_key";
 static NSString *const kLicenseOK = @"QDLicenseOK";
@@ -101,22 +102,63 @@ static UIViewController *QDTop(void) {
     return vc;
 }
 
-// ---------- Dòng LED chạy "Cảm ơn" ở đầu màn hình ----------
-static const NSTimeInterval kBannerSeconds = 0; // thời gian hiện (giây), 0 = hiện mãi
+// ---------- Dòng LED chạy vòng lặp + bảng thông tin (nhấn để mở/đóng) ----------
+static const NSTimeInterval kBannerSeconds = 0;  // thời gian hiện (giây), 0 = hiện mãi
+static const CGFloat kBannerSpeed = 70.0;        // tốc độ chữ chạy (điểm/giây)
 
-@interface QDPassWindow : UIWindow // không chặn thao tác chạm vào game
+// Thông tin key để hiện trong bảng
+static NSString *gCurKey;
+static long long gExpMs = 0;
+static double gRemainSec = 0;
+static CFTimeInterval gSyncMono = 0;
+
+static UIWindow *gBWin;
+static UIView *gRot, *gBar, *gClip, *gPanel;
+static UILabel *gBLabel, *gPLabel;
+static CADisplayLink *gBLink;
+static NSString *gBText, *gBRepeat;
+static CGFloat gBPeriod, gLastRot;
+static NSUInteger gBUnitLen, gBN;
+static CGSize gLastWS;
+static CFTimeInterval gBStart;
+static BOOL gPanelOn;
+
+@interface QDPassWindow : UIWindow // chỉ nhận chạm trên thanh LED và bảng, còn lại xuyên xuống game
 @end
 @implementation QDPassWindow
-- (UIView *)hitTest:(CGPoint)p withEvent:(UIEvent *)e { return nil; }
+- (UIView *)hitTest:(CGPoint)p withEvent:(UIEvent *)e {
+    UIView *v = [super hitTest:p withEvent:e];
+    if (v && ((gBar && [v isDescendantOfView:gBar]) || (gPanel && !gPanel.hidden && [v isDescendantOfView:gPanel])))
+        return v;
+    return nil;
+}
 @end
 
-static QDPassWindow *gBWin;
-static UIView *gBar, *gClip;
-static UILabel *gBLabel;
-static CADisplayLink *gBLink;
-static NSString *gBText;
-static CGFloat gBTextW;
-static CFTimeInterval gBStart;
+static CGFloat QDNorm(CGFloat a) {
+    while (a > M_PI) a -= 2 * M_PI;
+    while (a <= -M_PI) a += 2 * M_PI;
+    return a;
+}
+
+// Góc cần xoay để chữ luôn thẳng theo hướng cầm máy thực tế (game có thể tự xoay hình riêng)
+static CGFloat QDRotation(UIWindowScene *sc) {
+    CGFloat ad;
+    switch (UIDevice.currentDevice.orientation) {
+        case UIDeviceOrientationPortrait: ad = 0; break;
+        case UIDeviceOrientationPortraitUpsideDown: ad = M_PI; break;
+        case UIDeviceOrientationLandscapeLeft: ad = M_PI_2; break;
+        case UIDeviceOrientationLandscapeRight: ad = -M_PI_2; break;
+        default: return gLastRot; // nằm ngang/không rõ: giữ nguyên
+    }
+    CGFloat ai = 0;
+    switch (sc.interfaceOrientation) {
+        case UIInterfaceOrientationPortraitUpsideDown: ai = M_PI; break;
+        case UIInterfaceOrientationLandscapeRight: ai = M_PI_2; break;
+        case UIInterfaceOrientationLandscapeLeft: ai = -M_PI_2; break;
+        default: ai = 0;
+    }
+    return QDNorm(ad - ai);
+}
 
 @interface QDBanner : NSObject
 + (void)showThanksTry:(int)attempt;
@@ -137,44 +179,143 @@ static CFTimeInterval gBStart;
                            dispatch_get_main_queue(), ^{ [self showThanksTry:attempt + 1]; });
         return;
     }
+    [UIDevice.currentDevice beginGeneratingDeviceOrientationNotifications];
 
     gBWin = [[QDPassWindow alloc] initWithWindowScene:scene];
     gBWin.windowLevel = UIWindowLevelAlert + 100;
     gBWin.backgroundColor = UIColor.clearColor;
     UIViewController *vc = [UIViewController new];
     vc.view.backgroundColor = UIColor.clearColor;
-    vc.view.userInteractionEnabled = NO;
     gBWin.rootViewController = vc;
     gBWin.hidden = NO;
     gBWin.alpha = 0;
 
-    CGFloat W = vc.view.bounds.size.width;
-    gBar = [[UIView alloc] initWithFrame:CGRectMake(40, 8, W - 80, 28)];
-    gBar.autoresizingMask = UIViewAutoresizingFlexibleWidth;
+    gRot = [UIView new];
+    gRot.backgroundColor = UIColor.clearColor;
+    [vc.view addSubview:gRot];
+
+    gBar = [UIView new];
     gBar.backgroundColor = [UIColor colorWithWhite:0 alpha:0.78];
     gBar.layer.cornerRadius = 14;
     gBar.layer.borderWidth = 1.5;
     gBar.layer.shadowOpacity = 0.9;
     gBar.layer.shadowRadius = 6;
     gBar.layer.shadowOffset = CGSizeZero;
-    [vc.view addSubview:gBar];
+    [gBar addGestureRecognizer:[[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(togglePanel)]];
+    [gRot addSubview:gBar];
 
-    gClip = [[UIView alloc] initWithFrame:gBar.bounds];
-    gClip.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+    gClip = [UIView new];
     gClip.clipsToBounds = YES;
     gClip.layer.cornerRadius = 14;
+    gClip.userInteractionEnabled = NO;
     [gBar addSubview:gClip];
 
     gBText = @"★  Cảm ơn bạn đã sử dụng dịch vụ bên QDONENLITE  ★";
     gBLabel = [UILabel new];
     gBLabel.font = [UIFont boldSystemFontOfSize:15];
-    gBTextW = ceil([gBText sizeWithAttributes:@{NSFontAttributeName: gBLabel.font}].width) + 8;
+    gBLabel.lineBreakMode = NSLineBreakByClipping;
     [gClip addSubview:gBLabel];
 
+    gPanel = [UIView new];
+    gPanel.backgroundColor = [UIColor colorWithWhite:0 alpha:0.88];
+    gPanel.layer.cornerRadius = 14;
+    gPanel.layer.borderWidth = 1.5;
+    gPanel.hidden = YES;
+    [gPanel addGestureRecognizer:[[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(togglePanel)]];
+    gPLabel = [UILabel new];
+    gPLabel.numberOfLines = 0;
+    gPLabel.textColor = UIColor.whiteColor;
+    gPLabel.font = [UIFont monospacedSystemFontOfSize:12 weight:UIFontWeightMedium];
+    [gPanel addSubview:gPLabel];
+    [gRot addSubview:gPanel];
+
+    gPanelOn = NO;
+    gLastRot = 0;
+    [self relayout];
     gBStart = CACurrentMediaTime();
     gBLink = [CADisplayLink displayLinkWithTarget:self selector:@selector(tick:)];
     gBLink.preferredFramesPerSecond = 30;
     [gBLink addToRunLoop:NSRunLoop.mainRunLoop forMode:NSRunLoopCommonModes];
+}
+
+// Đặt lại vị trí/hướng theo cách cầm máy, và dựng chuỗi chữ lặp liền mạch
++ (void)relayout {
+    if (!gBWin) return;
+    UIView *root = gBWin.rootViewController.view;
+    CGSize ws = root.bounds.size;
+    CGFloat rot = QDRotation(gBWin.windowScene);
+    BOOL swap = fabs(fabs(rot) - M_PI_2) < 0.1;
+    CGSize L = swap ? CGSizeMake(ws.height, ws.width) : ws;
+    gLastRot = rot; gLastWS = ws;
+
+    gRot.transform = CGAffineTransformIdentity;
+    gRot.bounds = CGRectMake(0, 0, L.width, L.height);
+    gRot.center = CGPointMake(ws.width / 2, ws.height / 2);
+    gRot.transform = CGAffineTransformMakeRotation(rot);
+
+    CGFloat bw = MAX(120, L.width - 80);
+    gBar.frame = CGRectMake(40, 8, bw, 28);
+    gClip.frame = gBar.bounds;
+
+    NSString *unit = [gBText stringByAppendingString:@"        "];
+    gBUnitLen = unit.length;
+    NSDictionary *at = @{NSFontAttributeName: gBLabel.font};
+    CGFloat uw = MAX(40, [unit sizeWithAttributes:at].width);
+    gBN = (NSUInteger)ceil((bw + uw) / uw) + 1;
+    NSMutableString *rep = [NSMutableString string];
+    for (NSUInteger i = 0; i < gBN; i++) [rep appendString:unit];
+    gBRepeat = rep;
+    gBPeriod = [rep sizeWithAttributes:at].width / gBN;
+    if (gPanelOn) [self layoutPanel];
+}
+
++ (void)layoutPanel {
+    CGSize L = gRot.bounds.size;
+    CGFloat w = MIN(L.width - 80, 460);
+    CGSize sz = [gPLabel sizeThatFits:CGSizeMake(w - 24, CGFLOAT_MAX)];
+    gPanel.frame = CGRectMake((L.width - w) / 2, 44, w, sz.height + 24);
+    gPLabel.frame = CGRectMake(12, 12, w - 24, sz.height);
+}
+
++ (NSString *)dur:(double)sec {
+    long long t = (long long)sec;
+    long long d = t / 86400, h = (t % 86400) / 3600, m = (t % 3600) / 60, s = t % 60;
+    NSMutableArray *p = [NSMutableArray array];
+    if (d) [p addObject:[NSString stringWithFormat:@"%lld ngày", d]];
+    if (d || h) [p addObject:[NSString stringWithFormat:@"%lld giờ", h]];
+    if (d || h || m) [p addObject:[NSString stringWithFormat:@"%lld phút", m]];
+    [p addObject:[NSString stringWithFormat:@"%lld giây", s]];
+    return [p componentsJoinedByString:@" "];
+}
+
++ (NSString *)infoText {
+    NSString *exp, *remain;
+    if (gExpMs > 0) {
+        NSDateFormatter *f = [NSDateFormatter new];
+        f.dateFormat = @"dd/MM/yyyy HH:mm:ss";
+        exp = [f stringFromDate:[NSDate dateWithTimeIntervalSince1970:gExpMs / 1000.0]];
+        double left = gRemainSec - (CACurrentMediaTime() - gSyncMono);
+        remain = left <= 0 ? @"Đã hết hạn" : [self dur:left];
+    } else {
+        exp = @"Vĩnh viễn"; remain = @"Không giới hạn";
+    }
+    struct utsname u; uname(&u);
+    UIDevice *d = UIDevice.currentDevice;
+    return [NSString stringWithFormat:
+        @"Key: %@\nHết hạn: %@\nCòn lại: %@\nUID máy: %@\nTên máy: %@ (%s)\nHệ điều hành: iOS %@\n— Nhấn lần nữa để đóng —",
+        gCurKey ?: @"—", exp, remain, d.identifierForVendor.UUIDString ?: @"—",
+        d.name, u.machine, d.systemVersion];
+}
+
++ (void)togglePanel {
+    gPanelOn = !gPanelOn;
+    if (gPanelOn) {
+        gPLabel.text = [self infoText];
+        [self layoutPanel];
+        gPanel.hidden = NO;
+    } else {
+        gPanel.hidden = YES;
+    }
 }
 
 + (void)tick:(CADisplayLink *)l {
@@ -182,12 +323,15 @@ static CFTimeInterval gBStart;
     if (kBannerSeconds > 0 && t > kBannerSeconds) { [self hide]; return; }
     gBWin.alpha = MIN(1.0, t / 0.4);
 
+    // Phát hiện xoay máy hoặc đổi kích thước thì căn lại
+    CGSize ws = gBWin.rootViewController.view.bounds.size;
+    if (QDRotation(gBWin.windowScene) != gLastRot || !CGSizeEqualToSize(ws, gLastWS)) [self relayout];
+
     CGFloat phase = fmod(t * 0.35, 1.0);
     NSMutableAttributedString *as = [[NSMutableAttributedString alloc]
-        initWithString:gBText attributes:@{NSFontAttributeName: gBLabel.font}];
-    NSUInteger n = gBText.length;
-    for (NSUInteger i = 0; i < n; i++) {
-        CGFloat hue = fmod(phase + (CGFloat)i / n, 1.0);
+        initWithString:gBRepeat attributes:@{NSFontAttributeName: gBLabel.font}];
+    for (NSUInteger i = 0; i < gBRepeat.length; i++) {
+        CGFloat hue = fmod(phase + (CGFloat)(i % gBUnitLen) / gBUnitLen, 1.0);
         [as addAttribute:NSForegroundColorAttributeName
                    value:[UIColor colorWithHue:hue saturation:1 brightness:1 alpha:1]
                    range:NSMakeRange(i, 1)];
@@ -198,15 +342,22 @@ static CFTimeInterval gBStart;
     gBar.layer.borderColor = glow.CGColor;
     gBar.layer.shadowColor = glow.CGColor;
 
-    CGFloat cw = gClip.bounds.size.width;
-    CGFloat x = cw - fmod(t * 70.0, cw + gBTextW); // chạy từ phải sang trái
-    gBLabel.frame = CGRectMake(x, 0, gBTextW, gClip.bounds.size.height);
+    // Chạy từ phải sang trái, lặp liền mạch (các bản sao nối đuôi nhau)
+    CGFloat x = -fmod(t * kBannerSpeed, gBPeriod);
+    gBLabel.frame = CGRectMake(x, 0, gBPeriod * gBN + 4, gClip.bounds.size.height);
+
+    if (gPanelOn) {
+        gPanel.layer.borderColor = glow.CGColor;
+        NSString *txt = [self infoText];
+        if (![txt isEqualToString:gPLabel.text]) { gPLabel.text = txt; [self layoutPanel]; }
+    }
 }
 
 + (void)hide {
     [gBLink invalidate]; gBLink = nil;
+    [UIDevice.currentDevice endGeneratingDeviceOrientationNotifications];
     [UIView animateWithDuration:0.4 animations:^{ gBWin.alpha = 0; } completion:^(BOOL f) {
-        gBWin.hidden = YES; gBWin = nil; gBar = nil; gClip = nil; gBLabel = nil;
+        gBWin.hidden = YES; gBWin = nil; gRot = gBar = gClip = gPanel = nil; gBLabel = gPLabel = nil;
     }];
 }
 
@@ -238,6 +389,7 @@ static CFTimeInterval gBStart;
     QDCall(@"/api/verify", saved, ^(BOOL ok, NSString *err, long long exp, long long st) {
         dispatch_async(dispatch_get_main_queue(), ^{
             if (ok) {
+                gCurKey = saved;
                 [self scheduleExpiry:exp serverTime:st];
                 if (!gGranted) { gGranted = YES; [self granted]; }
                 return;
@@ -251,6 +403,9 @@ static CFTimeInterval gBStart;
 
 // Hẹn đúng lúc hết hạn (tính theo giờ server, không phụ thuộc đồng hồ máy)
 + (void)scheduleExpiry:(long long)exp serverTime:(long long)st {
+    gExpMs = exp;
+    gRemainSec = exp > 0 ? (exp - st) / 1000.0 : 0;
+    gSyncMono = CACurrentMediaTime();
     gGen++;
     if (exp <= 0) return; // key vĩnh viễn
     NSUInteger g = gGen;
@@ -323,6 +478,7 @@ static CFTimeInterval gBStart;
                     if (ok) {
                         [[NSUserDefaults standardUserDefaults] setObject:key forKey:kSavedKey];
                         gGranted = YES;
+                        gCurKey = [key uppercaseString];
                         [self scheduleExpiry:exp serverTime:st];
                         [self granted];
                     } else {
