@@ -101,6 +101,117 @@ static UIViewController *QDTop(void) {
     return vc;
 }
 
+// ---------- Dòng LED chạy "Cảm ơn" ở đầu màn hình ----------
+static const NSTimeInterval kBannerSeconds = 0; // thời gian hiện (giây), 0 = hiện mãi
+
+@interface QDPassWindow : UIWindow // không chặn thao tác chạm vào game
+@end
+@implementation QDPassWindow
+- (UIView *)hitTest:(CGPoint)p withEvent:(UIEvent *)e { return nil; }
+@end
+
+static QDPassWindow *gBWin;
+static UIView *gBar, *gClip;
+static UILabel *gBLabel;
+static CADisplayLink *gBLink;
+static NSString *gBText;
+static CGFloat gBTextW;
+static CFTimeInterval gBStart;
+
+@interface QDBanner : NSObject
++ (void)showThanksTry:(int)attempt;
+@end
+
+@implementation QDBanner
+
++ (void)showThanksTry:(int)attempt {
+    if (gBWin) return;
+    UIWindowScene *scene = nil;
+    for (UIScene *s in UIApplication.sharedApplication.connectedScenes) {
+        if ([s isKindOfClass:UIWindowScene.class] &&
+            s.activationState == UISceneActivationStateForegroundActive) { scene = (UIWindowScene *)s; break; }
+    }
+    if (!scene) {
+        if (attempt < 5)
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1 * NSEC_PER_SEC)),
+                           dispatch_get_main_queue(), ^{ [self showThanksTry:attempt + 1]; });
+        return;
+    }
+
+    gBWin = [[QDPassWindow alloc] initWithWindowScene:scene];
+    gBWin.windowLevel = UIWindowLevelAlert + 100;
+    gBWin.backgroundColor = UIColor.clearColor;
+    UIViewController *vc = [UIViewController new];
+    vc.view.backgroundColor = UIColor.clearColor;
+    vc.view.userInteractionEnabled = NO;
+    gBWin.rootViewController = vc;
+    gBWin.hidden = NO;
+    gBWin.alpha = 0;
+
+    CGFloat W = vc.view.bounds.size.width;
+    gBar = [[UIView alloc] initWithFrame:CGRectMake(40, 8, W - 80, 28)];
+    gBar.autoresizingMask = UIViewAutoresizingFlexibleWidth;
+    gBar.backgroundColor = [UIColor colorWithWhite:0 alpha:0.78];
+    gBar.layer.cornerRadius = 14;
+    gBar.layer.borderWidth = 1.5;
+    gBar.layer.shadowOpacity = 0.9;
+    gBar.layer.shadowRadius = 6;
+    gBar.layer.shadowOffset = CGSizeZero;
+    [vc.view addSubview:gBar];
+
+    gClip = [[UIView alloc] initWithFrame:gBar.bounds];
+    gClip.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+    gClip.clipsToBounds = YES;
+    gClip.layer.cornerRadius = 14;
+    [gBar addSubview:gClip];
+
+    gBText = @"★  Cảm ơn bạn đã sử dụng dịch vụ bên QDONENLITE  ★";
+    gBLabel = [UILabel new];
+    gBLabel.font = [UIFont boldSystemFontOfSize:15];
+    gBTextW = ceil([gBText sizeWithAttributes:@{NSFontAttributeName: gBLabel.font}].width) + 8;
+    [gClip addSubview:gBLabel];
+
+    gBStart = CACurrentMediaTime();
+    gBLink = [CADisplayLink displayLinkWithTarget:self selector:@selector(tick:)];
+    gBLink.preferredFramesPerSecond = 30;
+    [gBLink addToRunLoop:NSRunLoop.mainRunLoop forMode:NSRunLoopCommonModes];
+}
+
++ (void)tick:(CADisplayLink *)l {
+    CFTimeInterval t = CACurrentMediaTime() - gBStart;
+    if (kBannerSeconds > 0 && t > kBannerSeconds) { [self hide]; return; }
+    gBWin.alpha = MIN(1.0, t / 0.4);
+
+    CGFloat phase = fmod(t * 0.35, 1.0);
+    NSMutableAttributedString *as = [[NSMutableAttributedString alloc]
+        initWithString:gBText attributes:@{NSFontAttributeName: gBLabel.font}];
+    NSUInteger n = gBText.length;
+    for (NSUInteger i = 0; i < n; i++) {
+        CGFloat hue = fmod(phase + (CGFloat)i / n, 1.0);
+        [as addAttribute:NSForegroundColorAttributeName
+                   value:[UIColor colorWithHue:hue saturation:1 brightness:1 alpha:1]
+                   range:NSMakeRange(i, 1)];
+    }
+    gBLabel.attributedText = as;
+
+    UIColor *glow = [UIColor colorWithHue:phase saturation:1 brightness:1 alpha:1];
+    gBar.layer.borderColor = glow.CGColor;
+    gBar.layer.shadowColor = glow.CGColor;
+
+    CGFloat cw = gClip.bounds.size.width;
+    CGFloat x = cw - fmod(t * 70.0, cw + gBTextW); // chạy từ phải sang trái
+    gBLabel.frame = CGRectMake(x, 0, gBTextW, gClip.bounds.size.height);
+}
+
++ (void)hide {
+    [gBLink invalidate]; gBLink = nil;
+    [UIView animateWithDuration:0.4 animations:^{ gBWin.alpha = 0; } completion:^(BOOL f) {
+        gBWin.hidden = YES; gBWin = nil; gBar = nil; gClip = nil; gBLabel = nil;
+    }];
+}
+
+@end
+
 @interface QDLicense : NSObject
 @end
 
@@ -171,6 +282,7 @@ static UIViewController *QDTop(void) {
 
 + (void)granted {
     [[NSNotificationCenter defaultCenter] postNotificationName:kLicenseOK object:nil];
+    [QDBanner showThanksTry:0];
 }
 
 + (NSString *)text:(NSString *)err {
