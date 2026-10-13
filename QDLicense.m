@@ -105,6 +105,8 @@ static UIViewController *QDTop(void) {
 // ---------- Dòng LED chạy vòng lặp + bảng thông tin (nhấn để mở/đóng) ----------
 static const NSTimeInterval kBannerSeconds = 0;  // thời gian hiện (giây), 0 = hiện mãi
 static const CGFloat kBannerSpeed = 70.0;        // tốc độ chữ chạy (điểm/giây)
+// Thanh LED luôn nằm chính giữa màn hình, độ rộng theo tỉ lệ chiều ngang
+static const CGFloat kBarWidthFrac = 0.54;       // độ rộng thanh: 54% màn hình (tăng = dài hơn)
 
 // Thông tin key để hiện trong bảng
 static NSString *gCurKey;
@@ -253,8 +255,8 @@ static CGFloat QDRotation(UIWindowScene *sc) {
     gRot.center = CGPointMake(ws.width / 2, ws.height / 2);
     gRot.transform = CGAffineTransformMakeRotation(rot);
 
-    CGFloat bw = MAX(120, L.width - 80);
-    gBar.frame = CGRectMake(40, 8, bw, 28);
+    CGFloat bw = MAX(160, L.width * kBarWidthFrac);
+    gBar.frame = CGRectMake((L.width - bw) / 2, 8, bw, 28); // căn giữa hai bên cân bằng
     gClip.frame = gBar.bounds;
 
     NSString *unit = [gBText stringByAppendingString:@"        "];
@@ -271,9 +273,11 @@ static CGFloat QDRotation(UIWindowScene *sc) {
 
 + (void)layoutPanel {
     CGSize L = gRot.bounds.size;
-    CGFloat w = MIN(L.width - 80, 460);
+    CGFloat w = MIN(MAX(gBar.frame.size.width, 360), L.width - 20);
+    CGFloat x = gBar.frame.origin.x + (gBar.frame.size.width - w) / 2; // căn giữa dưới thanh LED
+    x = MAX(10, MIN(x, L.width - w - 10));
     CGSize sz = [gPLabel sizeThatFits:CGSizeMake(w - 24, CGFLOAT_MAX)];
-    gPanel.frame = CGRectMake((L.width - w) / 2, 44, w, sz.height + 24);
+    gPanel.frame = CGRectMake(x, 44, w, sz.height + 24);
     gPLabel.frame = CGRectMake(12, 12, w - 24, sz.height);
 }
 
@@ -322,6 +326,9 @@ static CGFloat QDRotation(UIWindowScene *sc) {
     CFTimeInterval t = CACurrentMediaTime() - gBStart;
     if (kBannerSeconds > 0 && t > kBannerSeconds) { [self hide]; return; }
     gBWin.alpha = MIN(1.0, t / 0.4);
+    // Giữ thanh LED luôn hiện: nếu bị ẩn/thấp hơn cửa sổ khác thì đưa lên lại
+    if (gBWin.hidden) gBWin.hidden = NO;
+    if (gBWin.windowLevel < UIWindowLevelAlert + 100) gBWin.windowLevel = UIWindowLevelAlert + 100;
 
     // Phát hiện xoay máy hoặc đổi kích thước thì căn lại
     CGSize ws = gBWin.rootViewController.view.bounds.size;
