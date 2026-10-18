@@ -10,6 +10,7 @@ static NSString *const kSavedKey = @"qd_license_key";
 static NSString *const kLicenseOK = @"QDLicenseOK";
 static NSString *const kLicenseExpired = @"QDLicenseExpired";
 static BOOL gPrompting = NO;
+static BOOL gChecking = NO; // đang có 1 lần kiểm tra key chạy: không chạy thêm lần nữa
 static BOOL gGranted = NO;
 static NSUInteger gGen = 0;
 // YES: hết hạn/bị thu hồi thì thoát game, mở lại phải nhập key mới. NO: chỉ hiện ô nhập key mới.
@@ -73,7 +74,7 @@ static NSString *QDNormKey(NSString *k) {
             componentsJoinedByString:@""];
 }
 
-static void QDCall(NSString *path, NSString *key, QDDone done) {
+static void QDCallOnce(NSString *path, NSString *key, QDDone done) {
     key = QDNormKey(key);
     NSURL *url = [NSURL URLWithString:[QDBase() stringByAppendingString:path]];
     NSString *dev = [[[UIDevice currentDevice] identifierForVendor] UUIDString] ?: @"unknown";
@@ -81,7 +82,7 @@ static void QDCall(NSString *path, NSString *key, QDDone done) {
 
     NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:url];
     req.HTTPMethod = @"POST";
-    req.timeoutInterval = 60;
+    req.timeoutInterval = 45;
     [req setValue:@"application/json" forHTTPHeaderField:@"Content-Type"];
     req.HTTPBody = [NSJSONSerialization dataWithJSONObject:@{@"key": key, @"device_id": dev, @"nonce": nonce}
                                                    options:0 error:nil];
@@ -104,6 +105,24 @@ static void QDCall(NSString *path, NSString *key, QDDone done) {
             if (llabs(now - st) > 600000) { done(NO, @"bad_time", 0, 0); return; }
             done(ok, ok ? nil : (err.length ? err : @"error"), exp, st);
         }] resume];
+}
+
+// Gọi server, tự thử lại khi lỗi mạng (server đang khởi động chậm sẽ không báo lỗi ngay)
+static void QDCall(NSString *path, NSString *key, QDDone done) {
+    __block int tries = 0;
+    __block void (^go)(void);
+    go = ^{
+        QDCallOnce(path, key, ^(BOOL ok, NSString *err, long long exp, long long st) {
+            if (!ok && [err isEqualToString:@"network"] && ++tries < 3) {
+                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2 * NSEC_PER_SEC)),
+                               dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), go);
+                return;
+            }
+            go = nil;
+            done(ok, err, exp, st);
+        });
+    };
+    go();
 }
 
 static UIViewController *QDTop(void) {
@@ -942,6 +961,8 @@ static QDKeyVC *gKeyVC;
 }
 
 + (void)start {
+    NSURL *wu = [NSURL URLWithString:QDBase()]; // đánh thức server sớm
+    if (wu) [[[NSURLSession sharedSession] dataTaskWithURL:wu] resume];
     [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(recheck)
         name:UIApplicationDidBecomeActiveNotification object:nil];
     [NSTimer scheduledTimerWithTimeInterval:30 target:self selector:@selector(recheck)
@@ -950,12 +971,14 @@ static QDKeyVC *gKeyVC;
 }
 
 + (void)recheck {
-    if (gPrompting) return;
+    if (gPrompting || gChecking) return;
     NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
     NSString *saved = [ud stringForKey:kSavedKey];
     if (!saved.length) { [self promptWithMessage:kPromptHint]; return; }
+    gChecking = YES;
     QDCall(@"/api/verify", saved, ^(BOOL ok, NSString *err, long long exp, long long st) {
         dispatch_async(dispatch_get_main_queue(), ^{
+            gChecking = NO;
             if (ok) {
                 gCurKey = saved;
                 [self scheduleExpiry:exp serverTime:st];
