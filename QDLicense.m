@@ -99,6 +99,7 @@ static void QDCallOnce(NSString *path, NSString *key, QDDone done) {
             NSString *msg = [NSString stringWithFormat:@"%d|%@|%lld|%lld|%@|%@|%@",
                              ok ? 1 : 0, err, exp, st, nonce, key, dev];
 
+            if ([j[@"error"] isEqual:@"rate_limited"]) { done(NO, @"network", 0, 0); return; } // bị giới hạn tốc độ: thử lại
             if (![j[@"nonce"] isEqual:nonce]) { done(NO, @"bad_nonce", 0, 0); return; }
             if (!QDVerify(msg, j[@"sig"])) { done(NO, @"bad_sig", 0, 0); return; }
             long long now = (long long)([[NSDate date] timeIntervalSince1970] * 1000);
@@ -616,6 +617,7 @@ typedef void (^QDKeySubmit)(NSString *key);
 @property (nonatomic, copy) QDKeySubmit onSubmit;
 - (void)showMessage:(NSString *)m error:(BOOL)err;
 - (void)setBusy:(BOOL)b;
+- (void)enterNotice:(NSString *)m; // chế độ thông báo: chỉ có nút THOÁT
 @end
 
 @implementation QDKeyVC {
@@ -627,7 +629,7 @@ typedef void (^QDKeySubmit)(NSString *key);
     UIActivityIndicatorView *_spin;
     CAGradientLayer *_cardGrad, *_btnGrad;
     CGFloat _kb;
-    BOOL _busy, _err;
+    BOOL _busy, _err, _notice;
 }
 
 + (UIColor *)blue { return [UIColor colorWithRed:0.18 green:0.62 blue:1.0 alpha:1]; }
@@ -637,7 +639,7 @@ typedef void (^QDKeySubmit)(NSString *key);
 - (BOOL)shouldAutorotate { return YES; }
 
 - (NSAttributedString *)btnTitle {
-    return [[NSAttributedString alloc] initWithString:@"KÍCH HOẠT"
+    return [[NSAttributedString alloc] initWithString:_notice ? @"THOÁT GAME" : @"KÍCH HOẠT"
         attributes:@{NSFontAttributeName: [UIFont systemFontOfSize:15 weight:UIFontWeightHeavy],
                      NSKernAttributeName: @1.8, NSForegroundColorAttributeName: UIColor.whiteColor}];
 }
@@ -830,6 +832,7 @@ typedef void (^QDKeySubmit)(NSString *key);
     CGFloat pad = dense ? 14 : 22, gap = dense ? 8 : 14, fh = dense ? 46 : 52;
 
     _logoWrap.hidden = _title.hidden = _tag.hidden = _foot.hidden = dense;
+    _tf.hidden = _notice;
     _divider.hidden = !wide;
 
     CGFloat cw, fx, fw, lw = 0;
@@ -838,7 +841,7 @@ typedef void (^QDKeySubmit)(NSString *key);
 
     CGSize ms = [_msg sizeThatFits:CGSizeMake(fw - 48, CGFLOAT_MAX)];
     CGFloat ph = MAX(36, ceil(ms.height) + 18);
-    CGFloat formH = ph + gap + fh + gap + fh + (dense ? 0 : 26);
+    CGFloat formH = _notice ? (ph + gap + fh + (dense ? 0 : 26)) : (ph + gap + fh + gap + fh + (dense ? 0 : 26));
     CGFloat logoS = wide ? 84 : 88;
     CGFloat brandH = dense ? 0 : (logoS + 10 + 32 + 4 + 14);
     CGFloat contentH = wide ? MAX(formH, brandH) : (dense ? 0 : brandH + 20) + formH;
@@ -863,7 +866,7 @@ typedef void (^QDKeySubmit)(NSString *key);
     _pillIcon.frame = CGRectMake(11, (ph - 18) / 2, 18, 18);
     _msg.frame = CGRectMake(38, 9, fw - 48, ph - 18);
     y += ph + gap;
-    _tf.frame = CGRectMake(fx, y, fw, fh); y += fh + gap;
+    if (!_notice) { _tf.frame = CGRectMake(fx, y, fw, fh); y += fh + gap; }
     _btn.frame = CGRectMake(fx, y, fw, fh);
     _btnGrad.frame = _btn.bounds;
     _btn.layer.shadowPath = [UIBezierPath bezierPathWithRoundedRect:_btn.bounds cornerRadius:14].CGPath;
@@ -935,7 +938,19 @@ typedef void (^QDKeySubmit)(NSString *key);
     if (b) [_spin startAnimating]; else [_spin stopAnimating];
 }
 
+- (void)enterNotice:(NSString *)m {
+    [self loadViewIfNeeded];
+    _notice = YES;
+    _tf.hidden = YES;
+    [self.view endEditing:YES];
+    [_btn setAttributedTitle:[self btnTitle] forState:UIControlStateNormal];
+    _foot.text = @"QDONENLITE rất hân hạnh khi hỗ trợ bạn";
+    [self showMessage:m error:YES];
+    [self.view setNeedsLayout];
+}
+
 - (void)submit {
+    if (_notice) { exit(0); }
     if (_busy) return;
     NSString *key = QDNormKey(_tf.text);
     if (!key.length) { [self showMessage:@"Vui lòng nhập key" error:YES]; return; }
@@ -961,6 +976,8 @@ static QDKeyVC *gKeyVC;
 }
 
 + (void)start {
+    if (getenv("QDLIC_ON")) return; // chỉ cho một bản license chạy trong tiến trình
+    setenv("QDLIC_ON", "1", 1);
     NSURL *wu = [NSURL URLWithString:QDBase()]; // đánh thức server sớm
     if (wu) [[[NSURLSession sharedSession] dataTaskWithURL:wu] resume];
     [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(recheck)
@@ -1013,14 +1030,20 @@ static QDKeyVC *gKeyVC;
         object:nil userInfo:@{@"error": err ?: @""}];
     if (!kKickOnExpire) { [self promptWithMessage:[self text:err]]; return; }
     gPrompting = YES; // chặn các lần kiểm tra khác trong lúc chờ thoát
-    UIViewController *top = QDTop();
-    if (top) {
-        NSString *msg = [[self text:err] stringByAppendingString:@"\nGame sẽ thoát. Hãy mở lại và nhập key mới."];
-        UIAlertController *a = [UIAlertController alertControllerWithTitle:@"Thông báo"
-            message:msg preferredStyle:UIAlertControllerStyleAlert];
-        [a addAction:[UIAlertAction actionWithTitle:@"Thoát" style:UIAlertActionStyleDefault
-            handler:^(UIAlertAction *x) { exit(0); }]];
-        [top presentViewController:a animated:YES completion:nil];
+    NSString *msg = [[self text:err] stringByAppendingString:@"\nGame sẽ thoát. Hãy mở lại và nhập key mới."];
+    if (gKeyVC) {
+        [gKeyVC setBusy:NO];
+        [gKeyVC enterNotice:msg];
+    } else {
+        UIViewController *top = QDTop();
+        if (top) {
+            QDKeyVC *vc = [QDKeyVC new];
+            vc.modalPresentationStyle = UIModalPresentationOverFullScreen;
+            vc.modalTransitionStyle = UIModalTransitionStyleCrossDissolve;
+            [vc enterNotice:msg];
+            gKeyVC = vc;
+            [top presentViewController:vc animated:YES completion:nil];
+        }
     }
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(6 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{ exit(0); });
