@@ -64,8 +64,17 @@ static BOOL QDVerify(NSString *msg, NSString *sigB64) {
         (__bridge CFDataRef)[msg dataUsingEncoding:NSUTF8StringEncoding], (__bridge CFDataRef)sig, NULL);
 }
 
+// Chuẩn hóa key: viết hoa, bỏ khoảng trắng, đổi mọi loại dấu gạch ngang lạ thành "-"
+static NSString *QDNormKey(NSString *k) {
+    NSMutableString *m = [[(k ?: @"") uppercaseString] mutableCopy];
+    for (NSString *d in @[@"\u2010", @"\u2011", @"\u2012", @"\u2013", @"\u2014", @"\u2015", @"\u2212"])
+        [m replaceOccurrencesOfString:d withString:@"-" options:0 range:NSMakeRange(0, m.length)];
+    return [[m componentsSeparatedByCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet]
+            componentsJoinedByString:@""];
+}
+
 static void QDCall(NSString *path, NSString *key, QDDone done) {
-    key = [[key stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet] uppercaseString];
+    key = QDNormKey(key);
     NSURL *url = [NSURL URLWithString:[QDBase() stringByAppendingString:path]];
     NSString *dev = [[[UIDevice currentDevice] identifierForVendor] UUIDString] ?: @"unknown";
     NSString *nonce = [[NSUUID UUID].UUIDString stringByReplacingOccurrencesOfString:@"-" withString:@""];
@@ -89,7 +98,8 @@ static void QDCall(NSString *path, NSString *key, QDDone done) {
             NSString *msg = [NSString stringWithFormat:@"%d|%@|%lld|%lld|%@|%@|%@",
                              ok ? 1 : 0, err, exp, st, nonce, key, dev];
 
-            if (![j[@"nonce"] isEqual:nonce] || !QDVerify(msg, j[@"sig"])) { done(NO, @"bad_response", 0, 0); return; }
+            if (![j[@"nonce"] isEqual:nonce]) { done(NO, @"bad_nonce", 0, 0); return; }
+            if (!QDVerify(msg, j[@"sig"])) { done(NO, @"bad_sig", 0, 0); return; }
             long long now = (long long)([[NSDate date] timeIntervalSince1970] * 1000);
             if (llabs(now - st) > 600000) { done(NO, @"bad_time", 0, 0); return; }
             done(ok, ok ? nil : (err.length ? err : @"error"), exp, st);
@@ -119,15 +129,17 @@ static const CGFloat kBarWidthFrac = 0.54;       // độ rộng thanh: 54% màn
 static const CGFloat kBubbleSize = 46;           // đường kính hình tròn avatar khi thu nhỏ
 
 // Thông tin key để hiện trong bảng
+static NSString *const kHideRecKey = @"qd_hide_on_record";
 static NSString *gCurKey;
 static long long gExpMs = 0;
 static double gRemainSec = 0;
 static CFTimeInterval gSyncMono = 0;
 
 static UIWindow *gBWin;
-static UIView *gRot, *gBar, *gClip, *gPanel, *gBubble;
-static UILabel *gBLabel, *gPLabel;
-static CADisplayLink *gBLink;
+static UIView *gRot, *gBar, *gClip, *gPanel, *gBubble, *gSwRow;
+static UILabel *gBLabel, *gPLabel, *gSwLabel, *gHint;
+static UISwitch *gSwitch;
+static NSTimer *gBTimer;
 static NSString *gBText, *gBRepeat;
 static CGFloat gBPeriod, gLastRot;
 static NSUInteger gBUnitLen, gBN;
@@ -136,13 +148,20 @@ static CFTimeInterval gBStart;
 static BOOL gPanelOn, gCollapsed, gBubbleSet;
 static CGPoint gBubblePos;
 
+// Mặc định BẬT: ẩn LED khi đang quay màn hình / phản chiếu màn hình
+static BOOL QDHideOnRec(void) {
+    id v = [[NSUserDefaults standardUserDefaults] objectForKey:kHideRecKey];
+    return v ? [v boolValue] : YES;
+}
+
 @interface QDPassWindow : UIWindow // chỉ nhận chạm trên thanh LED và bảng, còn lại xuyên xuống game
 @end
 @implementation QDPassWindow
 - (UIView *)hitTest:(CGPoint)p withEvent:(UIEvent *)e {
     UIView *v = [super hitTest:p withEvent:e];
-    if (v && ((gBar && [v isDescendantOfView:gBar]) || (gPanel && !gPanel.hidden && [v isDescendantOfView:gPanel]) ||
-                 (gBubble && !gBubble.hidden && [v isDescendantOfView:gBubble])))
+    if (v && ((gBar && [v isDescendantOfView:gBar]) ||
+              (gPanel && !gPanel.hidden && [v isDescendantOfView:gPanel]) ||
+              (gBubble && !gBubble.hidden && [v isDescendantOfView:gBubble])))
         return v;
     return nil;
 }
@@ -172,6 +191,26 @@ static CGFloat QDRotation(UIWindowScene *sc) {
         default: ai = 0;
     }
     return QDNorm(ad - ai);
+}
+
+// Viền/bóng đổi màu cầu vồng bằng animation của hệ thống (không tốn CPU)
+static void QDGlowAnim(CALayer *l) {
+    static NSArray *cols;
+    static dispatch_once_t t;
+    dispatch_once(&t, ^{
+        NSMutableArray *a = [NSMutableArray array];
+        for (int i = 0; i <= 8; i++)
+            [a addObject:(id)[UIColor colorWithHue:i / 8.0 saturation:1 brightness:1 alpha:1].CGColor];
+        cols = a;
+    });
+    for (NSString *kp in @[@"borderColor", @"shadowColor"]) {
+        CAKeyframeAnimation *a = [CAKeyframeAnimation animationWithKeyPath:kp];
+        a.values = cols;
+        a.duration = 3.0;
+        a.repeatCount = HUGE_VALF;
+        a.removedOnCompletion = NO;
+        [l addAnimation:a forKey:[@"glow_" stringByAppendingString:kp]];
+    }
 }
 
 @interface QDBanner : NSObject
@@ -237,10 +276,14 @@ static CGFloat QDRotation(UIWindowScene *sc) {
     gBLabel.lineBreakMode = NSLineBreakByClipping;
     [gClip addSubview:gBLabel];
 
+    // Bảng thông tin + công tắc ẩn khi quay màn hình
     gPanel = [UIView new];
     gPanel.backgroundColor = [UIColor colorWithWhite:0 alpha:0.88];
     gPanel.layer.cornerRadius = 14;
     gPanel.layer.borderWidth = 1.5;
+    gPanel.layer.shadowOpacity = 0.6;
+    gPanel.layer.shadowRadius = 6;
+    gPanel.layer.shadowOffset = CGSizeZero;
     gPanel.hidden = YES;
     [gPanel addGestureRecognizer:[[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(togglePanel)]];
     gPLabel = [UILabel new];
@@ -248,6 +291,26 @@ static CGFloat QDRotation(UIWindowScene *sc) {
     gPLabel.textColor = UIColor.whiteColor;
     gPLabel.font = [UIFont monospacedSystemFontOfSize:12 weight:UIFontWeightMedium];
     [gPanel addSubview:gPLabel];
+
+    gSwRow = [UIView new];
+    gSwLabel = [UILabel new];
+    gSwLabel.text = @"Ẩn LED khi quay màn hình";
+    gSwLabel.textColor = UIColor.whiteColor;
+    gSwLabel.font = [UIFont systemFontOfSize:13 weight:UIFontWeightSemibold];
+    [gSwRow addSubview:gSwLabel];
+    gSwitch = [UISwitch new];
+    gSwitch.on = QDHideOnRec();
+    gSwitch.onTintColor = [UIColor colorWithRed:0.18 green:0.62 blue:1 alpha:1];
+    [gSwitch addTarget:self action:@selector(hideSwitchChanged:) forControlEvents:UIControlEventValueChanged];
+    [gSwRow addSubview:gSwitch];
+    [gPanel addSubview:gSwRow];
+
+    gHint = [UILabel new];
+    gHint.numberOfLines = 0;
+    gHint.text = @"Nhấn vào bảng để đóng • Nhấn 3 lần vào thanh LED để thu nhỏ";
+    gHint.textColor = [UIColor colorWithWhite:1 alpha:0.5];
+    gHint.font = [UIFont systemFontOfSize:10.5];
+    [gPanel addSubview:gHint];
     [gRot addSubview:gPanel];
 
     // Hình tròn avatar (hiện khi thu nhỏ thanh LED)
@@ -259,6 +322,7 @@ static CGFloat QDRotation(UIWindowScene *sc) {
     gBubble.layer.shadowOpacity = 0.9;
     gBubble.layer.shadowRadius = 6;
     gBubble.layer.shadowOffset = CGSizeZero;
+    gBubble.layer.shadowPath = [UIBezierPath bezierPathWithOvalInRect:gBubble.bounds].CGPath;
     UIImageView *av = [[UIImageView alloc] initWithImage:QDAvatar()];
     av.frame = CGRectInset(gBubble.bounds, 3, 3);
     av.contentMode = UIViewContentModeScaleAspectFill;
@@ -275,11 +339,57 @@ static CGFloat QDRotation(UIWindowScene *sc) {
     gCollapsed = NO; gBubbleSet = NO;
     gPanelOn = NO;
     gLastRot = 0;
+
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(applyRecordingState)
+            name:UIScreenCapturedDidChangeNotification object:nil];
+    });
+
     [self relayout];
+    [self ensureAnims];
+    [self applyRecordingState];
     gBStart = CACurrentMediaTime();
-    gBLink = [CADisplayLink displayLinkWithTarget:self selector:@selector(tick:)];
-    gBLink.preferredFramesPerSecond = 30;
-    [gBLink addToRunLoop:NSRunLoop.mainRunLoop forMode:NSRunLoopCommonModes];
+    [UIView animateWithDuration:0.4 animations:^{ gBWin.alpha = 1; }];
+
+    // Chỉ kiểm tra nhẹ vài lần mỗi giây; hiệu ứng chạy do hệ thống đảm nhiệm
+    gBTimer = [NSTimer timerWithTimeInterval:0.4 target:self selector:@selector(tick:) userInfo:nil repeats:YES];
+    gBTimer.tolerance = 0.15;
+    [[NSRunLoop mainRunLoop] addTimer:gBTimer forMode:NSRunLoopCommonModes];
+}
+
+// Đang quay/phản chiếu màn hình và công tắc bật => ẩn toàn bộ LED + thanh trên cùng
++ (void)applyRecordingState {
+    if (!gBWin) return;
+    UIScreen *scr = gBWin.windowScene.screen ?: UIScreen.mainScreen;
+    BOOL hide = QDHideOnRec() && scr.isCaptured;
+    if (gBWin.hidden != hide) gBWin.hidden = hide;
+}
+
++ (void)hideSwitchChanged:(UISwitch *)sw {
+    [[NSUserDefaults standardUserDefaults] setBool:sw.on forKey:kHideRecKey];
+    [self applyRecordingState];
+}
+
++ (void)ensureAnims {
+    if (!gBar) return;
+    for (UIView *v in @[gBar, gBubble, gPanel])
+        if (![v.layer animationForKey:@"glow_borderColor"]) QDGlowAnim(v.layer);
+    if (gBLabel && ![gBLabel.layer animationForKey:@"scroll"]) [self startScroll];
+}
+
+// Chữ chạy bằng animation của hệ thống, lặp liền mạch
++ (void)startScroll {
+    [gBLabel.layer removeAnimationForKey:@"scroll"];
+    if (gBPeriod <= 0) return;
+    CABasicAnimation *a = [CABasicAnimation animationWithKeyPath:@"transform.translation.x"];
+    a.fromValue = @0;
+    a.toValue = @(-gBPeriod);
+    a.duration = gBPeriod / kBannerSpeed;
+    a.repeatCount = HUGE_VALF;
+    a.timingFunction = [CAMediaTimingFunction functionWithName:kCAMediaTimingFunctionLinear];
+    a.removedOnCompletion = NO;
+    [gBLabel.layer addAnimation:a forKey:@"scroll"];
 }
 
 // Đặt lại vị trí/hướng theo cách cầm máy, và dựng chuỗi chữ lặp liền mạch
@@ -299,6 +409,7 @@ static CGFloat QDRotation(UIWindowScene *sc) {
 
     CGFloat bw = MAX(160, L.width * kBarWidthFrac);
     gBar.frame = CGRectMake((L.width - bw) / 2, 8, bw, 28); // căn giữa hai bên cân bằng
+    gBar.layer.shadowPath = [UIBezierPath bezierPathWithRoundedRect:gBar.bounds cornerRadius:14].CGPath;
     gClip.frame = gBar.bounds;
     if (gBubbleSet) [self placeBubble];
 
@@ -311,6 +422,18 @@ static CGFloat QDRotation(UIWindowScene *sc) {
     for (NSUInteger i = 0; i < gBN; i++) [rep appendString:unit];
     gBRepeat = rep;
     gBPeriod = [rep sizeWithAttributes:at].width / gBN;
+
+    // Tô màu cầu vồng một lần duy nhất (không cập nhật từng khung hình)
+    NSMutableAttributedString *as = [[NSMutableAttributedString alloc] initWithString:gBRepeat attributes:at];
+    for (NSUInteger i = 0; i < gBRepeat.length; i++) {
+        CGFloat hue = (CGFloat)(i % gBUnitLen) / gBUnitLen;
+        [as addAttribute:NSForegroundColorAttributeName
+                   value:[UIColor colorWithHue:hue saturation:1 brightness:1 alpha:1]
+                   range:NSMakeRange(i, 1)];
+    }
+    gBLabel.attributedText = as;
+    gBLabel.frame = CGRectMake(0, 0, gBPeriod * gBN + 4, gClip.bounds.size.height);
+    [self startScroll];
     if (gPanelOn) [self layoutPanel];
 }
 
@@ -319,9 +442,18 @@ static CGFloat QDRotation(UIWindowScene *sc) {
     CGFloat w = MIN(MAX(gBar.frame.size.width, 360), L.width - 20);
     CGFloat x = gBar.frame.origin.x + (gBar.frame.size.width - w) / 2; // căn giữa dưới thanh LED
     x = MAX(10, MIN(x, L.width - w - 10));
-    CGSize sz = [gPLabel sizeThatFits:CGSizeMake(w - 24, CGFLOAT_MAX)];
-    gPanel.frame = CGRectMake(x, 44, w, sz.height + 24);
-    gPLabel.frame = CGRectMake(12, 12, w - 24, sz.height);
+    CGFloat iw = w - 24;
+    CGSize sz = [gPLabel sizeThatFits:CGSizeMake(iw, CGFLOAT_MAX)];
+    CGFloat y = 12;
+    gPLabel.frame = CGRectMake(12, y, iw, sz.height); y += sz.height + 8;
+    gSwRow.frame = CGRectMake(12, y, iw, 34); y += 34 + 2;
+    gSwLabel.frame = CGRectMake(0, 0, iw - 60, 34);
+    gSwitch.frame = CGRectMake(iw - gSwitch.bounds.size.width, (34 - gSwitch.bounds.size.height) / 2,
+                               gSwitch.bounds.size.width, gSwitch.bounds.size.height);
+    CGSize hs = [gHint sizeThatFits:CGSizeMake(iw, CGFLOAT_MAX)];
+    gHint.frame = CGRectMake(12, y, iw, hs.height); y += hs.height + 12;
+    gPanel.frame = CGRectMake(x, 44, w, y);
+    gPanel.layer.shadowPath = [UIBezierPath bezierPathWithRoundedRect:gPanel.bounds cornerRadius:14].CGPath;
 }
 
 + (NSString *)dur:(double)sec {
@@ -349,7 +481,7 @@ static CGFloat QDRotation(UIWindowScene *sc) {
     struct utsname u; uname(&u);
     UIDevice *d = UIDevice.currentDevice;
     return [NSString stringWithFormat:
-        @"Key: %@\nHết hạn: %@\nCòn lại: %@\nUID máy: %@\nTên máy: %@ (%s)\nHệ điều hành: iOS %@\n— Nhấn lần nữa để đóng —",
+        @"Key: %@\nHết hạn: %@\nCòn lại: %@\nUID máy: %@\nTên máy: %@ (%s)\nHệ điều hành: iOS %@",
         gCurKey ?: @"—", exp, remain, d.identifierForVendor.UUIDString ?: @"—",
         d.name, u.machine, d.systemVersion];
 }
@@ -417,6 +549,7 @@ static CGFloat QDRotation(UIWindowScene *sc) {
     gPanelOn = !gPanelOn;
     if (gPanelOn) {
         gPLabel.text = [self infoText];
+        gSwitch.on = QDHideOnRec();
         [self layoutPanel];
         gPanel.hidden = NO;
     } else {
@@ -424,53 +557,33 @@ static CGFloat QDRotation(UIWindowScene *sc) {
     }
 }
 
-+ (void)tick:(CADisplayLink *)l {
-    CFTimeInterval t = CACurrentMediaTime() - gBStart;
-    if (kBannerSeconds > 0 && t > kBannerSeconds) { [self hide]; return; }
-    gBWin.alpha = MIN(1.0, t / 0.4);
-    // Giữ thanh LED luôn hiện: nếu bị ẩn/thấp hơn cửa sổ khác thì đưa lên lại
-    if (gBWin.hidden) gBWin.hidden = NO;
++ (void)tick:(NSTimer *)tm {
+    if (!gBWin) return;
+    if (kBannerSeconds > 0 && CACurrentMediaTime() - gBStart > kBannerSeconds) { [self hide]; return; }
+    [self applyRecordingState];
+    if (gBWin.hidden) return; // đang ẩn vì quay màn hình
     if (gBWin.windowLevel < UIWindowLevelAlert + 100) gBWin.windowLevel = UIWindowLevelAlert + 100;
 
     // Phát hiện xoay máy hoặc đổi kích thước thì căn lại
     CGSize ws = gBWin.rootViewController.view.bounds.size;
     if (QDRotation(gBWin.windowScene) != gLastRot || !CGSizeEqualToSize(ws, gLastWS)) [self relayout];
 
-    CGFloat phase = fmod(t * 0.35, 1.0);
-    UIColor *glow = [UIColor colorWithHue:phase saturation:1 brightness:1 alpha:1];
-    gBubble.layer.borderColor = glow.CGColor;
-    gBubble.layer.shadowColor = glow.CGColor;
-
-    if (!gCollapsed) {
-        NSMutableAttributedString *as = [[NSMutableAttributedString alloc]
-            initWithString:gBRepeat attributes:@{NSFontAttributeName: gBLabel.font}];
-        for (NSUInteger i = 0; i < gBRepeat.length; i++) {
-            CGFloat hue = fmod(phase + (CGFloat)(i % gBUnitLen) / gBUnitLen, 1.0);
-            [as addAttribute:NSForegroundColorAttributeName
-                       value:[UIColor colorWithHue:hue saturation:1 brightness:1 alpha:1]
-                       range:NSMakeRange(i, 1)];
-        }
-        gBLabel.attributedText = as;
-        gBar.layer.borderColor = glow.CGColor;
-        gBar.layer.shadowColor = glow.CGColor;
-
-        // Chạy từ phải sang trái, lặp liền mạch (các bản sao nối đuôi nhau)
-        CGFloat x = -fmod(t * kBannerSpeed, gBPeriod);
-        gBLabel.frame = CGRectMake(x, 0, gBPeriod * gBN + 4, gClip.bounds.size.height);
-    }
+    [self ensureAnims]; // hệ thống xóa animation khi app ra nền: gắn lại
 
     if (gPanelOn) {
-        gPanel.layer.borderColor = glow.CGColor;
         NSString *txt = [self infoText];
         if (![txt isEqualToString:gPLabel.text]) { gPLabel.text = txt; [self layoutPanel]; }
     }
 }
 
 + (void)hide {
-    [gBLink invalidate]; gBLink = nil;
+    [gBTimer invalidate]; gBTimer = nil;
     [UIDevice.currentDevice endGeneratingDeviceOrientationNotifications];
     [UIView animateWithDuration:0.4 animations:^{ gBWin.alpha = 0; } completion:^(BOOL f) {
-        gBWin.hidden = YES; gBWin = nil; gRot = gBar = gClip = gPanel = gBubble = nil; gCollapsed = NO; gBubbleSet = NO; gBLabel = gPLabel = nil;
+        gBWin.hidden = YES; gBWin = nil;
+        gRot = gBar = gClip = gPanel = gBubble = gSwRow = nil;
+        gBLabel = gPLabel = gSwLabel = gHint = nil; gSwitch = nil;
+        gCollapsed = NO; gBubbleSet = NO;
     }];
 }
 
@@ -487,35 +600,38 @@ typedef void (^QDKeySubmit)(NSString *key);
 @end
 
 @implementation QDKeyVC {
-    UIVisualEffectView *_blur;
-    UIView *_dim, *_card, *_logoWrap;
-    UIImageView *_logo;
-    UILabel *_title, *_tag, *_msg;
+    UIView *_dim, *_card, *_logoWrap, *_pill, *_divider;
+    UIImageView *_logo, *_pillIcon;
+    UILabel *_title, *_tag, *_msg, *_foot;
     UITextField *_tf;
     UIButton *_btn;
     UIActivityIndicatorView *_spin;
     CAGradientLayer *_cardGrad, *_btnGrad;
     CGFloat _kb;
-    BOOL _busy;
+    BOOL _busy, _err;
 }
 
 + (UIColor *)blue { return [UIColor colorWithRed:0.18 green:0.62 blue:1.0 alpha:1]; }
++ (UIColor *)red { return [UIColor colorWithRed:1 green:0.45 blue:0.48 alpha:1]; }
 
 - (UIInterfaceOrientationMask)supportedInterfaceOrientations { return UIInterfaceOrientationMaskAll; }
 - (BOOL)shouldAutorotate { return YES; }
+
+- (NSAttributedString *)btnTitle {
+    return [[NSAttributedString alloc] initWithString:@"KÍCH HOẠT"
+        attributes:@{NSFontAttributeName: [UIFont systemFontOfSize:15 weight:UIFontWeightHeavy],
+                     NSKernAttributeName: @1.8, NSForegroundColorAttributeName: UIColor.whiteColor}];
+}
 
 - (void)viewDidLoad {
     [super viewDidLoad];
     UIColor *blue = [QDKeyVC blue];
     self.view.backgroundColor = UIColor.clearColor;
 
-    _blur = [[UIVisualEffectView alloc] initWithEffect:[UIBlurEffect effectWithStyle:UIBlurEffectStyleDark]];
-    _blur.frame = self.view.bounds;
-    _blur.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
-    [self.view addSubview:_blur];
+    // Nền tối đơn giản (không làm mờ để không nặng máy khi game đang chạy phía sau)
     _dim = [[UIView alloc] initWithFrame:self.view.bounds];
-    _dim.autoresizingMask = _blur.autoresizingMask;
-    _dim.backgroundColor = [UIColor colorWithRed:0.01 green:0.03 blue:0.10 alpha:0.55];
+    _dim.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+    _dim.backgroundColor = [UIColor colorWithRed:0.01 green:0.02 blue:0.07 alpha:0.9];
     [self.view addSubview:_dim];
     UITapGestureRecognizer *bgTap = [[UITapGestureRecognizer alloc] initWithTarget:self.view action:@selector(endEditing:)];
     bgTap.cancelsTouchesInView = NO;
@@ -525,24 +641,23 @@ typedef void (^QDKeySubmit)(NSString *key);
     _card = [UIView new];
     _card.layer.cornerRadius = 26;
     _card.layer.borderWidth = 1.2;
-    _card.layer.borderColor = [blue colorWithAlphaComponent:0.85].CGColor;
+    _card.layer.borderColor = [blue colorWithAlphaComponent:0.8].CGColor;
     _card.layer.shadowColor = blue.CGColor;
-    _card.layer.shadowRadius = 26;
-    _card.layer.shadowOpacity = 0.55;
+    _card.layer.shadowRadius = 24;
+    _card.layer.shadowOpacity = 0.5;
     _card.layer.shadowOffset = CGSizeZero;
     _cardGrad = [CAGradientLayer layer];
-    _cardGrad.colors = @[(id)[UIColor colorWithRed:0.05 green:0.11 blue:0.26 alpha:1].CGColor,
+    _cardGrad.colors = @[(id)[UIColor colorWithRed:0.06 green:0.13 blue:0.30 alpha:1].CGColor,
                          (id)[UIColor colorWithRed:0.02 green:0.04 blue:0.12 alpha:1].CGColor];
     _cardGrad.startPoint = CGPointMake(0, 0);
-    _cardGrad.endPoint = CGPointMake(1, 1);
+    _cardGrad.endPoint = CGPointMake(0.8, 1);
     _cardGrad.cornerRadius = 26;
     [_card.layer addSublayer:_cardGrad];
     [self.view addSubview:_card];
 
-    CABasicAnimation *pulse = [CABasicAnimation animationWithKeyPath:@"shadowOpacity"];
-    pulse.fromValue = @0.30; pulse.toValue = @0.80; pulse.duration = 1.8;
-    pulse.autoreverses = YES; pulse.repeatCount = HUGE_VALF;
-    [_card.layer addAnimation:pulse forKey:@"pulse"];
+    _divider = [UIView new];
+    _divider.backgroundColor = [blue colorWithAlphaComponent:0.25];
+    [_card addSubview:_divider];
 
     // Avatar tròn
     _logoWrap = [UIView new];
@@ -557,7 +672,6 @@ typedef void (^QDKeySubmit)(NSString *key);
     _logo = [[UIImageView alloc] initWithImage:QDAvatar()];
     _logo.contentMode = UIViewContentModeScaleAspectFill;
     _logo.clipsToBounds = YES;
-    _logo.layer.cornerRadius = 40;
     [_logoWrap addSubview:_logo];
     [_card addSubview:_logoWrap];
 
@@ -572,24 +686,31 @@ typedef void (^QDKeySubmit)(NSString *key);
     _title.attributedText = ts;
     _title.textAlignment = NSTextAlignmentCenter;
     _title.adjustsFontSizeToFitWidth = YES;
+    _title.minimumScaleFactor = 0.6;
     [_card addSubview:_title];
 
     _tag = [UILabel new];
     _tag.attributedText = [[NSAttributedString alloc] initWithString:@"PLAY SMARTER – WIN EASIER"
         attributes:@{NSFontAttributeName: [UIFont systemFontOfSize:10 weight:UIFontWeightMedium],
-                     NSKernAttributeName: @2.2,
+                     NSKernAttributeName: @2.0,
                      NSForegroundColorAttributeName: [UIColor colorWithRed:0.62 green:0.78 blue:1 alpha:0.8]}];
     _tag.textAlignment = NSTextAlignmentCenter;
     _tag.adjustsFontSizeToFitWidth = YES;
+    _tag.minimumScaleFactor = 0.6;
     [_card addSubview:_tag];
 
+    // Dải thông báo (xanh = hướng dẫn, đỏ = lỗi)
+    _pill = [UIView new];
+    _pill.layer.cornerRadius = 12;
+    _pill.layer.borderWidth = 1;
+    [_card addSubview:_pill];
+    _pillIcon = [UIImageView new];
+    _pillIcon.contentMode = UIViewContentModeScaleAspectFit;
+    [_pill addSubview:_pillIcon];
     _msg = [UILabel new];
     _msg.numberOfLines = 0;
-    _msg.textAlignment = NSTextAlignmentCenter;
     _msg.font = [UIFont systemFontOfSize:13 weight:UIFontWeightMedium];
-    _msg.textColor = [UIColor colorWithRed:0.72 green:0.82 blue:0.98 alpha:1];
-    _msg.text = kPromptHint;
-    [_card addSubview:_msg];
+    [_pill addSubview:_msg];
 
     // Ô nhập key
     _tf = [UITextField new];
@@ -603,9 +724,15 @@ typedef void (^QDKeySubmit)(NSString *key);
     _tf.font = [UIFont monospacedSystemFontOfSize:15 weight:UIFontWeightSemibold];
     _tf.attributedPlaceholder = [[NSAttributedString alloc] initWithString:@"QDONENLITE-XXX-XXXX-XXX"
         attributes:@{NSForegroundColorAttributeName: [UIColor colorWithWhite:1 alpha:0.3]}];
+    // Tắt các tính năng gõ thông minh (gây giật và làm đổi dấu gạch ngang)
     _tf.autocapitalizationType = UITextAutocapitalizationTypeAllCharacters;
     _tf.autocorrectionType = UITextAutocorrectionTypeNo;
     _tf.spellCheckingType = UITextSpellCheckingTypeNo;
+    _tf.smartDashesType = UITextSmartDashesTypeNo;
+    _tf.smartQuotesType = UITextSmartQuotesTypeNo;
+    _tf.smartInsertDeleteType = UITextSmartInsertDeleteTypeNo;
+    _tf.inputAssistantItem.leadingBarButtonGroups = @[];
+    _tf.inputAssistantItem.trailingBarButtonGroups = @[];
     _tf.keyboardAppearance = UIKeyboardAppearanceDark;
     _tf.returnKeyType = UIReturnKeyGo;
     _tf.clearButtonMode = UITextFieldViewModeWhileEditing;
@@ -622,19 +749,17 @@ typedef void (^QDKeySubmit)(NSString *key);
     _btn = [UIButton buttonWithType:UIButtonTypeCustom];
     _btn.layer.cornerRadius = 14;
     _btn.layer.shadowColor = blue.CGColor;
-    _btn.layer.shadowOpacity = 0.6;
-    _btn.layer.shadowRadius = 12;
+    _btn.layer.shadowOpacity = 0.55;
+    _btn.layer.shadowRadius = 10;
     _btn.layer.shadowOffset = CGSizeMake(0, 4);
     _btnGrad = [CAGradientLayer layer];
-    _btnGrad.colors = @[(id)[UIColor colorWithRed:0.20 green:0.70 blue:1.0 alpha:1].CGColor,
+    _btnGrad.colors = @[(id)[UIColor colorWithRed:0.22 green:0.72 blue:1.0 alpha:1].CGColor,
                         (id)[UIColor colorWithRed:0.05 green:0.35 blue:0.95 alpha:1].CGColor];
     _btnGrad.startPoint = CGPointMake(0, 0);
     _btnGrad.endPoint = CGPointMake(1, 1);
     _btnGrad.cornerRadius = 14;
     [_btn.layer insertSublayer:_btnGrad atIndex:0];
-    [_btn setAttributedTitle:[[NSAttributedString alloc] initWithString:@"KÍCH HOẠT"
-        attributes:@{NSFontAttributeName: [UIFont systemFontOfSize:15 weight:UIFontWeightHeavy],
-                     NSKernAttributeName: @1.8, NSForegroundColorAttributeName: UIColor.whiteColor}] forState:UIControlStateNormal];
+    [_btn setAttributedTitle:[self btnTitle] forState:UIControlStateNormal];
     [_btn addTarget:self action:@selector(submit) forControlEvents:UIControlEventTouchUpInside];
     [_btn addTarget:self action:@selector(btnDown) forControlEvents:UIControlEventTouchDown];
     [_btn addTarget:self action:@selector(btnUp) forControlEvents:UIControlEventTouchUpInside | UIControlEventTouchUpOutside | UIControlEventTouchCancel];
@@ -645,6 +770,15 @@ typedef void (^QDKeySubmit)(NSString *key);
     _spin.hidesWhenStopped = YES;
     [_btn addSubview:_spin];
 
+    _foot = [UILabel new];
+    _foot.text = @"Mỗi key chỉ gắn với một thiết bị";
+    _foot.textAlignment = NSTextAlignmentCenter;
+    _foot.font = [UIFont systemFontOfSize:11];
+    _foot.textColor = [UIColor colorWithWhite:1 alpha:0.4];
+    [_card addSubview:_foot];
+
+    [self applyStyle];
+
     NSNotificationCenter *nc = NSNotificationCenter.defaultCenter;
     [nc addObserver:self selector:@selector(kbChange:) name:UIKeyboardWillChangeFrameNotification object:nil];
     [nc addObserver:self selector:@selector(kbHide:) name:UIKeyboardWillHideNotification object:nil];
@@ -654,48 +788,77 @@ typedef void (^QDKeySubmit)(NSString *key);
 
 - (void)viewDidAppear:(BOOL)animated {
     [super viewDidAppear:animated];
-    _card.transform = CGAffineTransformMakeScale(0.9, 0.9);
+    _card.transform = CGAffineTransformMakeScale(0.92, 0.92);
     _card.alpha = 0;
-    [UIView animateWithDuration:0.45 delay:0 usingSpringWithDamping:0.78 initialSpringVelocity:0.6
+    [UIView animateWithDuration:0.35 delay:0 usingSpringWithDamping:0.82 initialSpringVelocity:0.5
                         options:0 animations:^{ self->_card.transform = CGAffineTransformIdentity; self->_card.alpha = 1; }
                      completion:nil];
 }
 
 - (void)viewDidLayoutSubviews { [super viewDidLayoutSubviews]; [self layoutCard]; }
 
+// Có 3 kiểu bố cục: dọc (điện thoại đứng), 2 cột (nằm ngang), gọn (khi bàn phím che nhiều)
 - (void)layoutCard {
     if (!_card) return;
     CGFloat W = self.view.bounds.size.width, H = self.view.bounds.size.height;
     if (W < 100 || H < 100) return;
     UIEdgeInsets sa = self.view.safeAreaInsets;
-    CGFloat availH = H - _kb - sa.top - (_kb > 0 ? 8 : sa.bottom) - 16;
-    BOOL compact = availH < 430;
-    CGFloat cw = MIN(340, W - 32), pad = 20, iw = cw - pad * 2, y = pad;
-
-    _logoWrap.hidden = _tag.hidden = compact;
-    if (!compact) {
-        _logoWrap.frame = CGRectMake((cw - 88) / 2, y, 88, 88);
-        _logo.frame = CGRectInset(_logoWrap.bounds, 4, 4);
-        y += 88 + 12;
-    }
-    _title.frame = CGRectMake(pad, y, iw, 32); y += 32;
-    if (!compact) { _tag.frame = CGRectMake(pad, y + 2, iw, 14); y += 16; }
-    y += 14;
-    CGSize ms = [_msg sizeThatFits:CGSizeMake(iw, CGFLOAT_MAX)];
-    CGFloat mh = MAX(18, ceil(ms.height));
-    _msg.frame = CGRectMake(pad, y, iw, mh); y += mh + 14;
-    _tf.frame = CGRectMake(pad, y, iw, 50); y += 50 + 14;
-    _btn.frame = CGRectMake(pad, y, iw, 50); y += 50 + pad;
-    _btnGrad.frame = _btn.bounds;
-    _spin.center = CGPointMake(_btn.bounds.size.width / 2, _btn.bounds.size.height / 2);
-
     CGFloat top = sa.top + 8;
-    CGFloat cy = top + MAX(0, (availH + 16 - y) / 2);
+    CGFloat bottom = _kb > 0 ? 8 : MAX(sa.bottom, 8);
+    CGFloat availH = H - _kb - top - bottom;
+    BOOL dense = availH < 270;
+    BOOL wide = !dense && W > H;
+    CGFloat pad = dense ? 14 : 22, gap = dense ? 8 : 14, fh = dense ? 46 : 52;
+
+    _logoWrap.hidden = _title.hidden = _tag.hidden = _foot.hidden = dense;
+    _divider.hidden = !wide;
+
+    CGFloat cw, fx, fw, lw = 0;
+    if (wide) { cw = MIN(640, W - 40); lw = floor(cw * 0.38); fx = lw + 14; fw = cw - fx - pad; }
+    else { cw = MIN(dense ? 440 : 360, W - 32); fx = pad; fw = cw - 2 * pad; }
+
+    CGSize ms = [_msg sizeThatFits:CGSizeMake(fw - 48, CGFLOAT_MAX)];
+    CGFloat ph = MAX(36, ceil(ms.height) + 18);
+    CGFloat formH = ph + gap + fh + gap + fh + (dense ? 0 : 26);
+    CGFloat logoS = wide ? 84 : 88;
+    CGFloat brandH = dense ? 0 : (logoS + 10 + 32 + 4 + 14);
+    CGFloat contentH = wide ? MAX(formH, brandH) : (dense ? 0 : brandH + 20) + formH;
+    CGFloat ch = contentH + 2 * pad;
+
+    CGFloat formY = wide ? pad + (contentH - formH) / 2 : pad + (dense ? 0 : brandH + 20);
+    if (!dense) {
+        CGFloat bx = wide ? 0 : pad, bw = wide ? lw : cw - 2 * pad;
+        CGFloat by = wide ? pad + (contentH - brandH) / 2 : pad;
+        _logoWrap.frame = CGRectMake(bx + (bw - logoS) / 2, by, logoS, logoS);
+        _logoWrap.layer.cornerRadius = logoS / 2;
+        _logoWrap.layer.shadowPath = [UIBezierPath bezierPathWithOvalInRect:_logoWrap.bounds].CGPath;
+        _logo.frame = CGRectInset(_logoWrap.bounds, 4, 4);
+        _logo.layer.cornerRadius = _logo.bounds.size.width / 2;
+        _title.frame = CGRectMake(bx + 6, by + logoS + 10, bw - 12, 32);
+        _tag.frame = CGRectMake(bx + 6, by + logoS + 10 + 32 + 4, bw - 12, 14);
+        _divider.frame = CGRectMake(lw, pad + 6, 1, ch - 2 * pad - 12);
+    }
+
+    CGFloat y = formY;
+    _pill.frame = CGRectMake(fx, y, fw, ph);
+    _pillIcon.frame = CGRectMake(11, (ph - 18) / 2, 18, 18);
+    _msg.frame = CGRectMake(38, 9, fw - 48, ph - 18);
+    y += ph + gap;
+    _tf.frame = CGRectMake(fx, y, fw, fh); y += fh + gap;
+    _btn.frame = CGRectMake(fx, y, fw, fh);
+    _btnGrad.frame = _btn.bounds;
+    _btn.layer.shadowPath = [UIBezierPath bezierPathWithRoundedRect:_btn.bounds cornerRadius:14].CGPath;
+    _spin.center = CGPointMake(fw / 2, fh / 2);
+    ((UIImageView *)_tf.leftView).frame = CGRectMake(0, 0, 42, fh);
+    if (!dense) _foot.frame = CGRectMake(fx, y + fh + 10, fw, 14);
+
+    CGFloat cy = ch >= availH ? top : top + (availH - ch) / 2;
     CGAffineTransform tr = _card.transform;
     _card.transform = CGAffineTransformIdentity;
-    _card.frame = CGRectMake((W - cw) / 2, cy, cw, y);
+    _card.frame = CGRectMake((W - cw) / 2, cy, cw, ch);
     _card.transform = tr;
     _cardGrad.frame = _card.bounds;
+    _card.layer.shadowPath = [UIBezierPath bezierPathWithRoundedRect:_card.bounds cornerRadius:26].CGPath;
 }
 
 - (void)kbChange:(NSNotification *)n {
@@ -709,23 +872,33 @@ typedef void (^QDKeySubmit)(NSString *key);
     [UIView animateWithDuration:d animations:^{ [self layoutCard]; }];
 }
 
-- (void)btnDown { [UIView animateWithDuration:0.12 animations:^{ self->_btn.transform = CGAffineTransformMakeScale(0.97, 0.97); self->_btn.alpha = 0.85; }]; }
+- (void)btnDown { [UIView animateWithDuration:0.1 animations:^{ self->_btn.transform = CGAffineTransformMakeScale(0.97, 0.97); self->_btn.alpha = 0.85; }]; }
 - (void)btnUp { [UIView animateWithDuration:0.15 animations:^{ self->_btn.transform = CGAffineTransformIdentity; self->_btn.alpha = 1; }]; }
 
+// Gõ phím: chỉ động tới giao diện đúng 1 lần (khi đang hiện lỗi), còn lại không làm gì để gõ mượt
 - (void)fieldChanged {
-    if (_msg.tag == 1) [self showMessage:kPromptHint error:NO]; // xóa báo lỗi khi gõ lại
+    if (_err) [self showMessage:kPromptHint error:NO];
 }
 - (void)textFieldDidBeginEditing:(UITextField *)t { t.layer.borderColor = [QDKeyVC blue].CGColor; }
 - (void)textFieldDidEndEditing:(UITextField *)t { t.layer.borderColor = [[QDKeyVC blue] colorWithAlphaComponent:0.35].CGColor; }
 - (BOOL)textFieldShouldReturn:(UITextField *)t { [self submit]; return NO; }
 
+- (void)applyStyle {
+    UIColor *c = _err ? [QDKeyVC red] : [QDKeyVC blue];
+    _pill.backgroundColor = [c colorWithAlphaComponent:0.12];
+    _pill.layer.borderColor = [c colorWithAlphaComponent:0.35].CGColor;
+    _pillIcon.tintColor = c;
+    _pillIcon.image = [UIImage systemImageNamed:_err ? @"exclamationmark.triangle.fill" : @"info.circle.fill"];
+    _msg.textColor = _err ? [UIColor colorWithRed:1 green:0.72 blue:0.73 alpha:1]
+                          : [UIColor colorWithRed:0.78 green:0.87 blue:1 alpha:1];
+}
+
 - (void)showMessage:(NSString *)m error:(BOOL)err {
     [self loadViewIfNeeded];
-    _msg.tag = err ? 1 : 0;
+    _err = err;
     _msg.text = m;
-    _msg.textColor = err ? [UIColor colorWithRed:1 green:0.45 blue:0.48 alpha:1]
-                         : [UIColor colorWithRed:0.72 green:0.82 blue:0.98 alpha:1];
-    [UIView animateWithDuration:0.2 animations:^{ [self layoutCard]; }];
+    [self applyStyle];
+    [self layoutCard];
     if (err) {
         CAKeyframeAnimation *k = [CAKeyframeAnimation animationWithKeyPath:@"transform.translation.x"];
         k.values = @[@0, @-9, @9, @-6, @6, @-3, @3, @0];
@@ -739,19 +912,15 @@ typedef void (^QDKeySubmit)(NSString *key);
     _busy = b;
     _btn.enabled = !b;
     _tf.enabled = !b;
-    _btn.alpha = b ? 0.9 : 1;
-    [_btn setAttributedTitle:b ? [[NSAttributedString alloc] initWithString:@""]
-        : [[NSAttributedString alloc] initWithString:@"KÍCH HOẠT"
-            attributes:@{NSFontAttributeName: [UIFont systemFontOfSize:15 weight:UIFontWeightHeavy],
-                         NSKernAttributeName: @1.8, NSForegroundColorAttributeName: UIColor.whiteColor}]
-                    forState:UIControlStateNormal];
+    [_btn setAttributedTitle:b ? [[NSAttributedString alloc] initWithString:@""] : [self btnTitle] forState:UIControlStateNormal];
     if (b) [_spin startAnimating]; else [_spin stopAnimating];
 }
 
 - (void)submit {
     if (_busy) return;
-    NSString *key = [_tf.text stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+    NSString *key = QDNormKey(_tf.text);
     if (!key.length) { [self showMessage:@"Vui lòng nhập key" error:YES]; return; }
+    _tf.text = key;
     [self.view endEditing:YES];
     [self setBusy:YES];
     [self showMessage:@"Đang kiểm tra key…" error:NO];
@@ -847,6 +1016,8 @@ static QDKeyVC *gKeyVC;
         @"revoked": @"Key đã bị khóa",
         @"network": @"Không kết nối được server, thử lại sau",
         @"bad_response": @"Phản hồi từ server không hợp lệ",
+        @"bad_nonce": @"Phản hồi từ server không hợp lệ (mã E1)",
+        @"bad_sig": @"Phản hồi từ server không hợp lệ (mã E2)",
         @"bad_time": @"Giờ trên máy không đúng, hãy bật cập nhật giờ tự động",
     };
     return m[err] ?: @"Lỗi kích hoạt";
@@ -875,9 +1046,9 @@ static QDKeyVC *gKeyVC;
         QDCall(@"/api/activate", key, ^(BOOL ok, NSString *err, long long exp, long long st) {
             dispatch_async(dispatch_get_main_queue(), ^{
                 if (ok) {
-                    [[NSUserDefaults standardUserDefaults] setObject:key forKey:kSavedKey];
+                    [[NSUserDefaults standardUserDefaults] setObject:QDNormKey(key) forKey:kSavedKey];
                     gGranted = YES;
-                    gCurKey = [key uppercaseString];
+                    gCurKey = QDNormKey(key);
                     [self scheduleExpiry:exp serverTime:st];
                     [gKeyVC dismissViewControllerAnimated:YES completion:^{
                         gKeyVC = nil;
