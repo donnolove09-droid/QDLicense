@@ -1,4 +1,4 @@
-// QDLicense.m - Kích hoạt key, phản hồi được ký (ECDSA P-256).
+// QDEnlLicense.m - Kích hoạt key, phản hồi được ký (ECDSA P-256).
 // - Chỉ chấp nhận phản hồi có chữ ký đúng + nonce khớp + giờ server lệch < 10 phút.
 // Khi key hợp lệ gửi NSNotification "QDLicenseOK"; hết hạn/thu hồi gửi "QDLicenseExpired".
 
@@ -174,9 +174,9 @@ static BOOL QDHideOnRec(void) {
     return v ? [v boolValue] : YES;
 }
 
-@interface QDPassWindow : UIWindow // chỉ nhận chạm trên thanh LED và bảng, còn lại xuyên xuống game
+@interface QDEnlWindow : UIWindow // chỉ nhận chạm trên thanh LED và bảng, còn lại xuyên xuống game
 @end
-@implementation QDPassWindow
+@implementation QDEnlWindow
 - (UIView *)hitTest:(CGPoint)p withEvent:(UIEvent *)e {
     UIView *v = [super hitTest:p withEvent:e];
     if (v && ((gBar && [v isDescendantOfView:gBar]) ||
@@ -233,13 +233,13 @@ static void QDGlowAnim(CALayer *l) {
     }
 }
 
-@interface QDBanner : NSObject
+@interface QDEnlBanner : NSObject
 + (void)showThanksTry:(int)attempt;
 + (void)collapse;
 + (void)expand;
 @end
 
-@implementation QDBanner
+@implementation QDEnlBanner
 
 + (void)showThanksTry:(int)attempt {
     if (gBWin) return;
@@ -256,7 +256,7 @@ static void QDGlowAnim(CALayer *l) {
     }
     [UIDevice.currentDevice beginGeneratingDeviceOrientationNotifications];
 
-    gBWin = [[QDPassWindow alloc] initWithWindowScene:scene];
+    gBWin = [[QDEnlWindow alloc] initWithWindowScene:scene];
     gBWin.windowLevel = UIWindowLevelAlert + 100;
     gBWin.backgroundColor = UIColor.clearColor;
     UIViewController *vc = [UIViewController new];
@@ -580,6 +580,10 @@ static void QDGlowAnim(CALayer *l) {
 + (void)tick:(NSTimer *)tm {
     if (!gBWin) return;
     if (kBannerSeconds > 0 && CACurrentMediaTime() - gBStart > kBannerSeconds) { [self hide]; return; }
+    // Nếu còn một bản license khác (cũ) trong game bật hộp "Kích hoạt" kiểu cũ thì tự đóng
+    UIViewController *top = QDTop();
+    if ([top isKindOfClass:UIAlertController.class] && [top.title isEqualToString:@"Kích hoạt"])
+        [top dismissViewControllerAnimated:NO completion:nil];
     [self applyRecordingState];
     if (gBWin.hidden) return; // đang ẩn vì quay màn hình
     if (gBWin.windowLevel < UIWindowLevelAlert + 100) gBWin.windowLevel = UIWindowLevelAlert + 100;
@@ -613,14 +617,14 @@ static void QDGlowAnim(CALayer *l) {
 static NSString *const kPromptHint = @"Nhập key để kích hoạt";
 typedef void (^QDKeySubmit)(NSString *key);
 
-@interface QDKeyVC : UIViewController <UITextFieldDelegate>
+@interface QDEnlKeyVC : UIViewController <UITextFieldDelegate>
 @property (nonatomic, copy) QDKeySubmit onSubmit;
 - (void)showMessage:(NSString *)m error:(BOOL)err;
 - (void)setBusy:(BOOL)b;
 - (void)enterNotice:(NSString *)m; // chế độ thông báo: chỉ có nút THOÁT
 @end
 
-@implementation QDKeyVC {
+@implementation QDEnlKeyVC {
     UIView *_dim, *_card, *_logoWrap, *_pill, *_divider;
     UIImageView *_logo, *_pillIcon;
     UILabel *_title, *_tag, *_msg, *_foot;
@@ -646,7 +650,7 @@ typedef void (^QDKeySubmit)(NSString *key);
 
 - (void)viewDidLoad {
     [super viewDidLoad];
-    UIColor *blue = [QDKeyVC blue];
+    UIColor *blue = [QDEnlKeyVC blue];
     self.view.backgroundColor = UIColor.clearColor;
 
     // Nền tối đơn giản (không làm mờ để không nặng máy khi game đang chạy phía sau)
@@ -901,12 +905,12 @@ typedef void (^QDKeySubmit)(NSString *key);
 - (void)fieldChanged {
     if (_err) [self showMessage:kPromptHint error:NO];
 }
-- (void)textFieldDidBeginEditing:(UITextField *)t { t.layer.borderColor = [QDKeyVC blue].CGColor; }
-- (void)textFieldDidEndEditing:(UITextField *)t { t.layer.borderColor = [[QDKeyVC blue] colorWithAlphaComponent:0.35].CGColor; }
+- (void)textFieldDidBeginEditing:(UITextField *)t { t.layer.borderColor = [QDEnlKeyVC blue].CGColor; }
+- (void)textFieldDidEndEditing:(UITextField *)t { t.layer.borderColor = [[QDEnlKeyVC blue] colorWithAlphaComponent:0.35].CGColor; }
 - (BOOL)textFieldShouldReturn:(UITextField *)t { [self submit]; return NO; }
 
 - (void)applyStyle {
-    UIColor *c = _err ? [QDKeyVC red] : [QDKeyVC blue];
+    UIColor *c = _err ? [QDEnlKeyVC red] : [QDEnlKeyVC blue];
     _pill.backgroundColor = [c colorWithAlphaComponent:0.12];
     _pill.layer.borderColor = [c colorWithAlphaComponent:0.35].CGColor;
     _pillIcon.tintColor = c;
@@ -963,12 +967,12 @@ typedef void (^QDKeySubmit)(NSString *key);
 
 @end
 
-static QDKeyVC *gKeyVC;
+static QDEnlKeyVC *gKeyVC;
 
-@interface QDLicense : NSObject
+@interface QDEnlLicense : NSObject
 @end
 
-@implementation QDLicense
+@implementation QDEnlLicense
 
 + (void)load {
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(5 * NSEC_PER_SEC)),
@@ -1037,7 +1041,7 @@ static QDKeyVC *gKeyVC;
     } else {
         UIViewController *top = QDTop();
         if (top) {
-            QDKeyVC *vc = [QDKeyVC new];
+            QDEnlKeyVC *vc = [QDEnlKeyVC new];
             vc.modalPresentationStyle = UIModalPresentationOverFullScreen;
             vc.modalTransitionStyle = UIModalTransitionStyleCrossDissolve;
             [vc enterNotice:msg];
@@ -1051,7 +1055,7 @@ static QDKeyVC *gKeyVC;
 
 + (void)granted {
     [[NSNotificationCenter defaultCenter] postNotificationName:kLicenseOK object:nil];
-    [QDBanner showThanksTry:0];
+    [QDEnlBanner showThanksTry:0];
 }
 
 + (NSString *)text:(NSString *)err {
@@ -1084,7 +1088,7 @@ static QDKeyVC *gKeyVC;
         return;
     }
     gPrompting = YES;
-    QDKeyVC *vc = [QDKeyVC new];
+    QDEnlKeyVC *vc = [QDEnlKeyVC new];
     vc.modalPresentationStyle = UIModalPresentationOverFullScreen;
     vc.modalTransitionStyle = UIModalTransitionStyleCrossDissolve;
     [vc showMessage:msg error:isErr];
